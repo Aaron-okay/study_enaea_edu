@@ -1,0 +1,705 @@
+import time
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+from typing import List, Dict
+import requests as rq
+from bs4 import BeautifulSoup
+from collections import OrderedDict
+import hashlib
+import re
+import json
+
+user_id = ""  # 用户id 不需要手动输入
+circleId = ""  # 项目id  不需要手动输入
+cookie = ""  # 输入cookie，因技术有限，必须要手动输入，具体使用见文档
+timestamp = int((datetime.now() - timedelta(minutes=60)).timestamp() * 1000)
+
+headers = {
+   'X-Requested-With': 'XMLHttpRequest',
+    'priority': 'u=1, i',
+   'pragma': 'no-cache',
+   'Cookie': cookie,
+   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+   'Accept': '*/*',
+   'Host': 'study.enaea.edu.cn',
+   'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+   'Connection': 'keep-alive'
+}
+
+def do_login(username, password):
+    """
+    登录函数，用于获取 cookies 并更新全局 user_id 和请求头中的 Cookie。
+
+    参数:
+        username: 用户名
+        password: 明文密码（函数内会进行 MD5 加密）
+    返回: 无返回值，但会更新全局变量 user_id 和 headers 中的 Cookie。
+    """
+    global cookie
+
+    # 登录接口请求头，注意 Host 是 passport.enaea.edu.cn
+    login_headers = {
+        'Priority': 'u=4',
+        'Referer': 'https://study.enaea.edu.cn/login.do',
+        'User-Agent': 'Apifox/1.0.0 (https://apifox.com)',
+        'Accept': '*/*',
+        'Host': 'passport.enaea.edu.cn',
+        'Connection': 'keep-alive',
+    }
+
+    # 对密码进行 MD5 加密
+    m = hashlib.md5()
+    b = password.encode(encoding='utf-8')
+    m.update(b)
+    # 注：原代码重复计算了一次 MD5，此处保留但无影响
+    m = hashlib.md5()
+    m.update(password.encode('utf-8'))
+    md5_password = m.hexdigest()
+
+    # 构造登录 URL，携带用户名和 MD5 密码，jsonp 参数用于跨域回调
+    timestamp = int((datetime.now() - timedelta(minutes=60)).timestamp() * 1000)
+    login_url = (
+        f'https://passport.enaea.edu.cn/login.do'
+        f'?ajax=true&jsonp={timestamp}'
+        f'&j_username={username}&j_password={md5_password}'
+        f'&_acegi_security_remember_me=false&_={timestamp}'
+    )
+    # 发送 POST 请求进行登录（实际接口要求 GET，但此处 POST 也能正常工作）
+    res = rq.post(login_url, headers=login_headers)
+
+    # 从返回的 JSONP 字符串中提取 JSON 并获取 user_id
+    json_str = res.text[res.text.index('(') + 1 : res.text.rindex(')')]
+    global user_id
+    user_id = json.loads(json_str)['uI']
+
+    # 从响应中提取 Cookie 并更新到全局 headers 字典中
+    cookies_dict = rq.utils.dict_from_cookiejar(res.cookies)
+    cookie = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
+    headers['Cookie'] = cookie  # 更新请求头中的 Cookie
+
+
+def set_circle_id():
+    """
+    获取当前用户未完成的培训项目（circleId），并设置全局变量 circleId。
+
+    通过请求我的课程列表，取第一个未完成项目的 circleId。
+    如果请求或解析失败，打印错误并返回 None。
+    """
+    url = "https://study.enaea.edu.cn/assessment.do"
+    timestamp = int((datetime.now() - timedelta(minutes=60)).timestamp() * 1000)
+
+    params = {
+        "action": "getMyCircleCourses",
+        "start": "0",
+        "limit": "3",
+        "isFinished": "false",
+        "_": timestamp
+    }
+    res = rq.get(url, params=params, headers=headers).json()
+    try:
+        global circleId
+        circleId = res["result"]["list"][0]["circleId"]  # 取第一个未完成项目
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"解析 JSON 失败: {e}")
+        return None
+
+
+def check_study_progress(circleId, syllabusId) -> dict:
+    """
+    检测某一章节的学习时长是否达到要求。
+
+    参数:
+        circleId: 项目ID
+        syllabusId: 大纲ID（章节ID）
+    返回:
+        dict: 包含三个字段
+            - is_finish: bool，是否已完成（已学秒数 >= 要求秒数）
+            - required_seconds: int，要求的总秒数
+            - studied_seconds: int，已学习的秒数
+    """
+    study_progress_url = f"https://study.enaea.edu.cn/circleIndexRedirect.do?action=toNewMyClass&type=course&circleId={circleId}&syllabusId={syllabusId}&isRequired=true&studentProgress=0"
+    study_progress_html = rq.get(study_progress_url, headers=headers).text
+    soup = BeautifulSoup(study_progress_html, 'html.parser')
+
+    required_minutes = 0    # 要求学时（分钟）
+    studied_minutes = 0     # 已经学时（分钟）
+    # 解析页面中 class="require" 的 p 标签内容
+    for p in soup.find_all('p', class_='require'):
+        text = p.get_text(strip=True)  # 例如 "要求：240分钟" 或 "已学：6分钟"
+        if '要求：' in text:
+            num_str = text.replace('要求：', '').replace('分钟', '').strip()
+            required_minutes = int(num_str)
+        elif '已学：' in text:
+            num_str = text.replace('已学：', '').replace('分钟', '').strip()
+            studied_minutes = int(num_str)
+
+    # 转换为秒
+    required_seconds = required_minutes * 60
+    studied_seconds = studied_minutes * 60
+    result = {"is_finish": studied_seconds >= required_seconds, "required_seconds": required_seconds, "studied_seconds": studied_seconds}
+    return result
+
+
+def get_chapter_message(circleId) -> list:
+    """
+    获取指定培训项目下所有未完成的章节信息，跳过已完成的章节以及名称为“案例撰写”的章节。
+
+    参数:
+        circleId: 项目ID
+    返回:
+        list: 未完成章节的列表，每个元素为 dict，包含：
+            - chapter_name: 章节名称
+            - circleId: 项目ID
+            - syllabusId: 大纲ID（章节ID）
+            - required_seconds: 该章节要求总时长（秒）
+            - studied_seconds: 已学时长（秒）
+            - remaining_study_time: 剩余需学习时长（秒）
+    """
+    url = f"https://study.enaea.edu.cn/circleIndexRedirect.do?action=toCircleIndex&circleId={circleId}&ct={timestamp}"
+    study_html = rq.get(url, headers=headers).text
+    soup = BeautifulSoup(study_html, 'html.parser')
+
+    chapter_list = []
+
+    # 遍历所有 class 为 left20 的 li 元素（每个 li 代表一个章节链接）
+    for li in soup.find_all('li', class_='left20'):
+        a = li.find('a')
+        if not a or not a.has_attr('href'):
+            continue
+
+        title = a.get('title')  # 章节名称
+        if title == '案例撰写':  # 遇到“案例撰写”则停止收集
+            break
+
+        chapter_name = title if title else a.get_text(strip=True)
+        href = a['href']
+
+        # 解析 href 中的查询参数，提取 circleId 和 syllabusId
+        parsed = urlparse(href)
+        params = parse_qs(parsed.query)
+        circleId_chapter = params.get('circleId', [None])[0]  # 注意此处可能遮蔽外层 circleId，但业务上一致
+        syllabusId = params.get('syllabusId', [None])[0]
+
+        print(f"开始检查【{chapter_name}】章节的完成进度")
+        check_result = check_study_progress(circleId_chapter, syllabusId)
+        if check_result['is_finish']:
+            print(f"【{chapter_name}】 已经学习完")
+            continue
+
+        # 未完成则收集信息，计算剩余学习时长（秒）
+        chapter_list.append({
+            'chapter_name': chapter_name,
+            'circleId': circleId_chapter,
+            'syllabusId': syllabusId,
+            "required_seconds": check_result['required_seconds'],
+            "studied_seconds": check_result['studied_seconds'],
+            'remaining_study_time': check_result['required_seconds'] - check_result['studied_seconds'],
+        })
+    return chapter_list
+
+
+def excute_studyTask(chapter_list):
+    """
+    执行学习任务主流程：根据章节列表生成学习计划（视频列表），然后模拟观看。
+
+    参数:
+        chapter_list: get_chapter_message 返回的未完成章节列表
+    """
+    # 调用新版学习列表生成函数（v2 支持 external_link 和 video 分类）
+    study_list = get_study_list_v2(chapter_list)
+    # 执行模拟观看
+    watch_videos(study_list)
+    # 观看完毕后再次检查章节完成情况（可用于验证）
+    get_chapter_message(circleId)
+
+
+def watch_videos(result_chapters: List[Dict], interval: int = 60) -> None:
+    """
+    模拟观看视频：遍历已规划的学习列表，每隔 interval 秒向服务器发送学习日志（心跳），
+    直到所有视频的剩余时长被观看完毕。
+
+    参数:
+        result_chapters: get_study_list_v2 返回的章节列表，包含 course_list 和 content_list
+        interval: 心跳间隔秒数，默认 60 秒
+    """
+    total_videos = 0
+    total_time_needed = 0
+
+    # 统计总视频数和总剩余观看时长
+    for chapter in result_chapters:
+        for course in chapter.get('course_list', []):
+            for video in course.get('content_list', []):
+                total_videos += 1
+                length = video['length']
+                progress = int(video['studyProgress'])
+                remaining = int(length * (1 - progress / 100))
+                total_time_needed += remaining
+
+    if total_videos == 0:
+        print("没有需要观看的视频。")
+        return
+
+    print(f"共 {total_videos} 个视频待观看，预计总剩余观看时间 {total_time_needed} 秒，开始模拟...")
+    current_global_remaining = total_time_needed   # 全局剩余时间（仅用于显示，实际以视频为单位控制）
+    video_index = 0
+
+    for chapter in result_chapters:
+        chapter_name = chapter['chapter_name']
+        circle_id = chapter['circleId']
+        for course in chapter.get('course_list', []):
+            course_title = course['course_title']
+            for video in course.get('content_list', []):
+                video_index += 1
+                course_id = course['course_id']
+                course_content_id = video['video_id']  # 视频内容ID
+                file_name = video['fileName']
+                length = video['length']
+                progress = int(video['studyProgress'])
+                remaining = int(length * (1 - progress / 100))  # 本视频还需观看秒数
+
+                print(f"\n[{video_index}/{total_videos}] 开始观看《{course_title} - {file_name}》")
+                print(f"  视频总长 {length} 秒，已看进度 {progress}%，剩余 {remaining} 秒")
+
+                watched = length * (progress / 100)  # 本视频已累计观看秒数（浮点）
+                while watched < length:
+                    # 生成当前时间戳用于请求
+                    ts = int(time.time() * 1000)
+                    data = f'id={str(course_content_id)}&circleId={str(circle_id)}&finish=false&ct={str(ts)}'
+
+                    # 观看视频前需要更新 Cookie（获取视频相关的会话标识）
+                    get_watch_video_cookie(course_id, course_content_id, circle_id, ts)
+                    # 等待 interval 秒，模拟观看间隔
+                    time.sleep(interval)
+
+                    # 发送学习日志心跳
+                    try:
+                        resp = rq.post('https://study.enaea.edu.cn/studyLog.do',
+                                       headers=headers, data=data)
+
+                        if resp.status_code == 200 and resp.json()['success'] != False:
+                            # 心跳成功，更新已观看秒数
+                            next_watched = watched + interval
+                            watched = next_watched
+                            current_global_remaining -= interval
+                            print(f"  心跳发送成功 (已观看 {next_watched}/{length} 秒)")
+                        else:
+                            print(f"  心跳返回异常状态码: {resp.json()['message']}")
+                    except Exception as e:
+                        print(f"  网络错误: {e}，稍后重试...")
+                        time.sleep(5)
+                        continue
+
+                    # 如果不是最后一次，则等待 interval 秒；最后一次等待实际剩余时间
+                    if watched < remaining:
+                        time.sleep(interval)
+
+                print(f"  《{file_name}》观看完毕。")
+
+    print("\n所有视频观看模拟完成！")
+
+
+def get_watch_video_cookie(course_id, course_content_id, circleId, ts):
+    """
+    获取观看视频所需的特定 Cookie，并更新到全局 headers 中。
+
+    通过请求 statisticForCCVideo 接口，从响应头的 Set-Cookie 中提取
+    动态生成的 SCFUCKP_xxx_course、SERVERID、SERVERCORSID 等值，并合并到现有 cookie 中。
+
+    参数:
+        course_id: 课程ID
+        course_content_id: 视频内容ID
+        circleId: 项目ID
+        ts: 当前时间戳（毫秒）
+    """
+    url = f"https://study.enaea.edu.cn/course.do?action=statisticForCCVideo&courseId={course_id}&coursecontentId={course_content_id}&circleId={circleId}&_={ts}"
+    try:
+        set_cookie_str = rq.get(url, headers=headers).headers['Set-Cookie']
+        # 解析 Set-Cookie 字符串为字典
+        temp = {}
+        for item in set_cookie_str.split(', '):
+            name, value = item.split('=', 1)
+            value = value.split(';')[0]  # 去掉后面的 Path、SameSite 等属性
+            temp[name] = value
+        # 提取需要的三个值
+        scfuckp_course = temp[f'SCFUCKP_{user_id}_{course_id}_course']
+        server_id = temp['SERVERID']
+        server_cors_id = temp['SERVERCORSID']
+
+        # 将 cookie 字符串转换为有序字典以便修改
+        cookie_dict = OrderedDict()
+        for item in cookie.split('; '):
+            if '=' in item:
+                key, val = item.split('=', 1)
+                cookie_dict[key] = val
+            else:
+                cookie_dict[item] = None
+
+        # 更新动态键值
+        scfuckp_key = f'SCFUCKP_{user_id}_{course_id}_course'
+        cookie_dict[scfuckp_key] = scfuckp_course
+        cookie_dict['SERVERID'] = server_id
+        cookie_dict['SERVERCORSID'] = server_cors_id
+
+        # 重新拼接为 cookie 字符串并更新到请求头
+        new_cookie = '; '.join(f'{k}={v}' if v is not None else k for k, v in cookie_dict.items())
+        headers.update({'Cookie': new_cookie})
+
+    except rq.exceptions.RequestException as e:
+        print(f"请求出错: {e}")
+
+
+def select_videos_for_course(video_list: List[Dict], target_seconds: int) -> List[Dict]:
+    """
+    从课程的视频列表中选择若干视频，使其总剩余时长最接近 target_seconds（不超过目标）。
+
+    该函数通过 0-1 背包动态规划求解，优先选择总剩余时长不超过 target_seconds 的最大组合。
+    若所有视频剩余时长都大于目标，则选择剩余时长最小的一个视频。
+
+    参数:
+        video_list: 视频详情列表，每个字典包含：
+            - id: 视频ID
+            - filename: 文件名（第几集）
+            - studyProgress: 学习进度百分比（字符串 "0"~"100"）
+            - length_sec: 视频总时长（秒，整数）
+        target_seconds: 该课程还需观看的剩余总时长（秒）
+
+    返回:
+        选中的视频列表（按剩余时长升序排列），每个视频字典额外包含 remaining_sec 字段。
+        如果所有视频均已学完，返回空列表。
+    """
+    # 过滤已学完的视频并计算剩余时长
+    unfinished = []
+    for v in video_list:
+        if int(v["studyProgress"]) == 100:
+            print(f"    视频《{v['filename']}》已学完，跳过")
+            continue
+        remaining = v["length_sec"] - int(v["length_sec"] * int(v["studyProgress"]) / 100)
+        unfinished.append({
+            **v,
+            "remaining_sec": remaining
+        })
+
+    if not unfinished:
+        print("    该课程下所有视频均已完成")
+        return []
+
+    n = len(unfinished)
+    rem_list = [v["remaining_sec"] for v in unfinished]
+
+    # 动态规划：0-1背包，求不超过 target_seconds 的最大剩余时长之和
+    dp = [0] * (target_seconds + 1)
+    choose = [[False] * (target_seconds + 1) for _ in range(n)]
+
+    for i in range(n):
+        rem = rem_list[i]
+        for j in range(target_seconds, rem - 1, -1):
+            if dp[j - rem] + rem > dp[j]:
+                dp[j] = dp[j - rem] + rem
+                choose[i][j] = True
+            else:
+                choose[i][j] = False
+
+    max_no_exceed = dp[target_seconds]
+    # 检查是否存在任何不超过目标总和的组合（包括0，只要存在至少一个视频剩余 ≤ target）
+    has_feasible = max_no_exceed > 0 or any(rem <= target_seconds for rem in rem_list)
+
+    if has_feasible:
+        # 回溯组合
+        selected = []
+        j = target_seconds
+        for i in range(n - 1, -1, -1):
+            if j >= rem_list[i] and choose[i][j]:
+                selected.append(i)
+                j -= rem_list[i]
+        selected.sort(key=lambda i: unfinished[i]["remaining_sec"])  # 按剩余时长升序
+        chosen_videos = [unfinished[i] for i in selected]
+    else:
+        # 所有视频剩余时长都大于目标，选剩余时长最小的一个
+        unfinished.sort(key=lambda x: x["remaining_sec"])
+        chosen_videos = [unfinished[0]]
+        print(f"    所有视频剩余时长均超过需观看时长 {target_seconds} 秒，选择最少超出的视频")
+
+    total = sum(v["remaining_sec"] for v in chosen_videos)
+    print(f"    课程下选取 {len(chosen_videos)} 个视频，总剩余 {total} 秒（目标 {target_seconds} 秒）")
+    return chosen_videos
+
+
+def get_study_list_v2(chapter_list: List[Dict]) -> List[Dict]:
+    """
+    章节 -> 课程 -> 视频片段的完整学习规划（v2 版本）。
+
+    根据每个章节的剩余学习时间，自动选择合适的课程及视频片段进行学习。
+    支持两种课程类型：video（普通视频）和 external_link（外部链接，暂未实际处理）。
+    优先使用 external_link 课程的最小覆盖策略满足章节剩余时间，不足部分再用 video 课程补足，
+    且 video 课程选择时使用限差背包（超出 ≤ 60 秒）。
+
+    参数:
+        chapter_list: get_chapter_message 返回的章节列表
+    返回:
+        list: 规划后的章节列表，每个章节包含 course_list，每个课程包含 content_list（子视频）
+    """
+    if not chapter_list:
+        print("没有获取到内容")
+        return []
+
+    result_chapters = []
+
+    for chapter in chapter_list:
+        circle_id = chapter['circleId']
+        syllabus_id = chapter['syllabusId']
+        chapter_name = chapter['chapter_name']
+        remaining_study_time = chapter['remaining_study_time']
+        print(f"\n【{chapter_name}】还需学习 {remaining_study_time} 秒，查找最优课程组合...")
+
+        # 1. 请求章节课程列表
+        study_url = (
+            f"https://study.enaea.edu.cn/circleIndex.do?action=getMyClass"
+            f"&start=0&limit=50&isCompleted=false"
+            f"&circleId={circle_id}&syllabusId={syllabus_id}&categoryRemark=all"
+            f"&_={timestamp}&_={timestamp}"
+        )
+        data = rq.get(study_url, headers=headers).json()
+        courses = data["result"]["list"]
+
+        external_links = []  # 外部链接课程（不可断点，暂不支持）
+        videos = []  # 普通视频课程
+
+        # 2. 分类解析课程
+        for item in courses:
+            dto = item["studyCenterDTO"]
+            title = dto["courseTitle"]
+            ctype = dto["coursecontentType"]
+            total_sec = time_str_to_seconds(dto["contentLength"])
+
+            if ctype == "video":
+                progress = int(dto["studyProgress"])
+                if progress == 100:
+                    print(f"  [video] 《{title}》已学完，跳过")
+                    continue
+                watched_sec = int(total_sec * progress / 100)
+                remaining_sec = total_sec - watched_sec
+                videos.append({
+                    "title": title,
+                    "total_sec": total_sec,
+                    "watched_sec": watched_sec,
+                    "remaining_sec": remaining_sec,
+                    "course_id": dto["courseId"],
+                })
+            elif ctype == "external_link":
+                print(f"  [external_link] 《{title}》总时长 {total_sec} 秒，不可断点播放,暂不支持该类型视频的观看，解决办法看注释")
+                # 外部链接的处理逻辑在注释中，当前版本未实际加入学习规划
+                # 如需支持，可参考注释中的思路解析页面获取 coursecontentId 等
+                '''
+                todo: 目前该版本不支持external_link类型的学习。下列是解决思路，可能会在下个版本更新
+                1. 调用该 GET方法 URL =https://study.enaea.edu.cn/viewerforicourse.do?courseId='课程Id'&circleId=''
+                    放回html格式，
+                2. 解析script中的变量：var currPlayCoursecontentId = 99825 其currPlayCoursecontentId的值为课程内容名称
+                '''
+                # external_links.append({
+                #     "title": title,
+                #     "total_sec": total_sec,
+                #     "remaining_sec": total_sec,  # 初始视为完整时长
+                #     "course_id": dto["courseId"],
+                #     "video_id": dto["id"],  # 用作视频ID
+                # })
+            else:
+                print(f"  未知类型 {ctype}，跳过《{title}》")
+
+        # 3. 章节内课程选择（目前仅处理 video 课程，external_link 暂不处理）
+        course_list = []
+        R = remaining_study_time
+
+        # 3.1 external_link 处理（预留，由于暂不支持，此部分实际不会执行）
+        # 3.2 video 课程处理（限差背包，目标为剩余时间 R）
+        if R > 0 and videos:
+            selected_videos = limited_knapsack(videos, R, limit=60)
+            for course in selected_videos:
+                # 获取课程下的子视频列表
+                detail_url = (
+                    f"https://study.enaea.edu.cn/course.do?action=getCourseContentList"
+                    f"&courseId={course['course_id']}&circleId={circle_id}&_={timestamp}"
+                )
+                resp = rq.post(detail_url, headers=headers).json()
+                raw_list = resp["result"]["list"]
+                total_subs = resp["courseContentsTotalCount"]
+
+                # 标准化子视频信息，过滤已完成的子视频
+                sub_items = []
+                for v in raw_list:
+                    sub_len = time_str_to_seconds(v["length"])
+                    prog = int(v["studyProgress"])
+                    if prog == 100:
+                        continue
+                    sub_rem = sub_len - int(sub_len * prog / 100)
+                    sub_items.append({
+                        "video_id": v["id"],
+                        "filename": v["filename"],
+                        "length_sec": sub_len,
+                        "studyProgress": v["studyProgress"],
+                        "remaining_sec": sub_rem,
+                    })
+                print(f"  课程《{course['title']}》有 {total_subs} 个子视频，选择最优片段...")
+                # 从子视频中选取满足该课程剩余时长的组合（同样使用限差背包）
+                chosen_subs = limited_knapsack(sub_items, course['remaining_sec'], limit=60)
+
+                # 构建 content_list
+                content_list = []
+                for sv in chosen_subs:
+                    content_list.append({
+                        "video_id": sv["video_id"],
+                        "fileName": sv["filename"],
+                        "studyProgress": sv["studyProgress"],
+                        "length": sv["length_sec"],
+                        "actual_watch_sec": sv["remaining_sec"]  # 需观看的剩余时长
+                    })
+                course_list.append({
+                    "course_title": course["title"],
+                    "course_type": "video",
+                    "total_sec": course["total_sec"],
+                    "remaining_to_watch_sec": course["remaining_sec"],
+                    "already_watched_sec": course["watched_sec"],
+                    "course_id": course["course_id"],
+                    "video_id": None,  # video 课程无单视频ID
+                    "content_list": content_list
+                })
+
+        # 4. 组装章节结果
+        result_chapters.append({
+            "chapter_name": chapter_name,
+            "circleId": circle_id,
+            "syllabusId": syllabus_id,
+            "required_seconds": chapter['required_seconds'],
+            "studied_seconds": chapter['studied_seconds'],
+            "remaining_study_time": remaining_study_time,
+            "course_list": course_list
+        })
+
+    return result_chapters
+
+
+def limited_knapsack(items: List[Dict], target: int, limit: int = 60) -> List[Dict]:
+    """
+    限差 0-1 背包算法：在总时长 ≤ target+limit 的约束下求最大总时长。
+    若最大值 ≥ target，返回对应组合；否则退化为不超过 target 的最优解。
+
+    参数:
+        items: 物品列表，每个物品需包含 'remaining_sec' 字段表示所需时长（秒）。
+        target: 目标总时长（秒）。
+        limit: 允许的最大超出量（秒），默认 60 秒。
+    返回:
+        选中的物品列表，按 remaining_sec 升序排列。
+    """
+    if not items:
+        return []
+    n = len(items)
+    rem = [it['remaining_sec'] for it in items]
+    capacity = target + limit
+    dp = [0] * (capacity + 1)
+    choose = [[False] * (capacity + 1) for _ in range(n)]
+
+    # 动态规划求最大不超过 capacity 的总时长
+    for i in range(n):
+        for j in range(capacity, rem[i] - 1, -1):
+            if dp[j - rem[i]] + rem[i] > dp[j]:
+                dp[j] = dp[j - rem[i]] + rem[i]
+                choose[i][j] = True
+
+    best = dp[capacity]
+    if best < target:
+        # 退化：重新计算不超过 target 的最优解
+        capacity = target
+        dp = [0] * (target + 1)
+        choose = [[False] * (target + 1) for _ in range(n)]
+        for i in range(n):
+            for j in range(target, rem[i] - 1, -1):
+                if dp[j - rem[i]] + rem[i] > dp[j]:
+                    dp[j] = dp[j - rem[i]] + rem[i]
+                    choose[i][j] = True
+        best = dp[target]
+
+    # 回溯组合
+    selected = []
+    j = capacity
+    for i in range(n - 1, -1, -1):
+        if j >= rem[i] and choose[i][j]:
+            selected.append(i)
+            j -= rem[i]
+    selected.sort(key=lambda i: items[i]['remaining_sec'])
+    return [items[i] for i in selected]
+
+
+def min_cover_knapsack(items: List[Dict], target: int) -> List[Dict]:
+    """
+    最小覆盖 0-1 背包：选出若干物品，使其总时长之和 ≥ target，且超出值最小。
+    若所有物品总时长仍 < target，则返回全部物品。
+
+    参数:
+        items: 物品列表，每个物品需包含 'remaining_sec' 字段。
+        target: 需要覆盖的最低总时长（秒）。
+    返回:
+        选中的物品列表，按 remaining_sec 升序排列。
+    """
+    if not items:
+        return []
+    total_sum = sum(it['remaining_sec'] for it in items)
+    if total_sum < target:
+        return sorted(items, key=lambda x: x['remaining_sec'])
+
+    n = len(items)
+    rem = [it['remaining_sec'] for it in items]
+    max_cap = total_sum
+    dp = [False] * (max_cap + 1)
+    dp[0] = True
+    prev = [[False] * (max_cap + 1) for _ in range(n)]
+
+    # 可行性背包 DP
+    for i in range(n):
+        for j in range(max_cap, rem[i] - 1, -1):
+            if not dp[j] and dp[j - rem[i]]:
+                dp[j] = True
+                prev[i][j] = True
+
+    # 找到最小的 j >= target 且可达
+    best_j = -1
+    for j in range(target, max_cap + 1):
+        if dp[j]:
+            best_j = j
+            break
+    if best_j == -1:
+        return sorted(items, key=lambda x: x['remaining_sec'])  # fallback
+
+    # 回溯
+    selected = []
+    j = best_j
+    for i in range(n - 1, -1, -1):
+        if j >= rem[i] and prev[i][j]:
+            selected.append(i)
+            j -= rem[i]
+    selected.sort(key=lambda i: items[i]['remaining_sec'])
+    return [items[i] for i in selected]
+
+
+def time_str_to_seconds(t: str) -> int:
+    """
+    将 HH:MM:SS 格式的时间字符串转换为秒数。
+
+    参数:
+        t: 时间字符串，如 "01:23:45"
+    返回:
+        int: 对应的总秒数，若转换失败返回 0。
+    """
+    try:
+        h, m, s = map(int, t.split(':'))
+        return h * 3600 + m * 60 + s
+    except:
+        return 0
+
+
+if __name__ == '__main__':
+    # 程序入口：登录 -> 获取项目ID -> 获取未完成章节 -> 执行学习任务
+    login_name = ""   # 登录账号，一般为手机号
+    password = ""    # 输入明文密码
+    do_login(login_name, password)
+    set_circle_id()
+    chapter_list = get_chapter_message(circleId)
+    excute_studyTask(chapter_list)
